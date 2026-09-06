@@ -10,9 +10,7 @@ Run with:
 
 from lib.corpus_config import EVENTSTORE_T1_PATH
 from lib.corpus_logging import logger
-from retrieval.lance_observation_index_store import (
-    LanceObservationIndexStore,
-)
+from retrieval.lance_observation_index_store import LanceObservationIndexStore
 from retrieval.macberth_phrase_encoder2 import MacBertMeanPhraseEncoder
 from retrieval.models import SearchSpace
 from retrieval.observation_retriever import IndexedObservationRetriever
@@ -20,17 +18,14 @@ from retrieval.parquet_context import ParquetContext
 
 YEAR = None
 SCALE = None
+K = 50
+PHRASE = "white as wool"
+CARRIER = "They had {}."
 
 space = SearchSpace(
     years=YEAR,
     scale=SCALE,
 )
-
-K = 50
-
-PHRASE = "white as wool"
-
-CARRIER = "This refers to {}."
 
 
 def main() -> None:
@@ -67,8 +62,8 @@ def main() -> None:
     logger.info(f"phrase:     {PHRASE}")
     logger.info(f"encoder:    {type(encoder).__name__}")
     logger.info(f"carrier:    {CARRIER}")
-    logger.info(f"year:       {YEAR}")
-    logger.info(f"scale:      {SCALE}")
+    logger.info(f"year:       {YEAR if YEAR is not None else 'ALL'}")
+    logger.info(f"scale:      {SCALE if SCALE is not None else 'ALL'}")
     logger.info(f"k:          {K}")
     logger.info(f"direction:  forward")
     logger.info("." * 70)
@@ -77,15 +72,15 @@ def main() -> None:
     logger.info("RESULTS")
     logger.info("=" * 70)
 
+
     all_results = []
+
 
     for (bucket_start, bucket_end), bucket_results in results:
         all_results.extend(bucket_results)
 
         logger.info("")
-        logger.info(
-            f"BUCKET {bucket_start}-{bucket_end}"
-        )
+        logger.info( f"BUCKET {bucket_start}-{bucket_end}" )
         logger.info("-" * 70)
 
         for rank, result in enumerate(bucket_results[:5], start=1):

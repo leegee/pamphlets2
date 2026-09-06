@@ -90,22 +90,6 @@ class IndexedObservationRetriever(ObservationRetriever):
             yield bucket, results
 
 
-            results: list[ObservationContext] = []
-
-            for scale in scales:
-                results.extend(
-                    self._context.get_many(
-                        results_by_scale[scale],
-                    )
-                )
-
-            results.sort( key=lambda result: result.distance )
-            if len(results) > k:
-                results = results[:k]
-
-            yield bucket, results
-
-
     def search(
         self,
         query: Float32Array,
