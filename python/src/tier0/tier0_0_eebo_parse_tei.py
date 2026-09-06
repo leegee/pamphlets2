@@ -598,10 +598,11 @@ def _worker_ingest(files, batch_docs, batch_tokens, skip_existing_docs, corpus):
                     corpus, doc_id, idx, tok = line.rstrip("\n").split("\t")
                     token_batch.append((corpus, doc_id, int(idx), tok))
 
-            if len(doc_batch) >= batch_docs:
+            if (
+                len(doc_batch) >= batch_docs
+                or len(token_batch) >= batch_tokens
+            ):
                 flush_docs()
-
-            if len(token_batch) >= batch_tokens:
                 flush_tokens()
 
             docs_seen += 1
