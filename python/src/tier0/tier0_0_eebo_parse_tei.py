@@ -569,19 +569,14 @@ def _worker_ingest(files, batch_docs, batch_tokens, skip_existing_docs, corpus):
         if not token_batch:
             return
 
-        rows = [
-            t for t in token_batch
-            if (t[0], t[1]) in inserted_doc_ids
-        ]
-
+        rows = token_batch
         token_batch = []
 
-        if rows:
-            stream_copy(
-                "tokens",
-                ["corpus", "doc_id", "token_idx", "token"],
-                rows,
-            )
+        stream_copy(
+            "tokens",
+            ["corpus", "doc_id", "token_idx", "token"],
+            rows,
+        )
 
     for fp in files:
         try:
