@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 ECCO_HEADER_DIR = Path( PROJECT_ROOT / "corpus/ecco_all/ecco/headers" )
 
 # XML_ROOT_DIR = PROJECT_ROOT / "corpus"
-XML_ROOT_DIR = "G:" / "corpus"
+XML_ROOT_DIR = Path("G:") / "corpus"
 
 CORPUS_INPUT_DIRS = {
     "eebo": XML_ROOT_DIR / "eebo_all",
