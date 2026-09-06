@@ -14,14 +14,16 @@ MAX_TOKENS_IN_DOC = 400_000
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 ECCO_HEADER_DIR = Path( PROJECT_ROOT / "corpus/ecco_all/ecco/headers" )
-XML_ROOT_DIR = PROJECT_ROOT / "corpus"
+
+# XML_ROOT_DIR = PROJECT_ROOT / "corpus"
+XML_ROOT_DIR = "G:" / "corpus"
 
 CORPUS_INPUT_DIRS = {
     "eebo": XML_ROOT_DIR / "eebo_all",
     "ecco": XML_ROOT_DIR / "ecco_all",
 }
 
-CLMET_CORPUS_INPUT_DIR = PROJECT_ROOT / "corpus" / "clmet" / "corpus"
+CLMET_CORPUS_INPUT_DIR = XML_ROOT_DIR / "clmet" / "corpus" / "txt" / "plain"
 
 try:
     import google.colab  #
