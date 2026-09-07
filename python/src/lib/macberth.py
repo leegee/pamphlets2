@@ -65,7 +65,7 @@ def get_device() -> str:
 
 def load_macberth(
     *,
-    use_qint8: bool = True,
+    use_qint8: bool = False,
 ) -> MacberthModel:
     """
     Loads MacBERTh with encoder + MLM head.
@@ -91,6 +91,7 @@ def load_macberth(
     )
 
     if use_qint8:
+        raise RuntimeError("Do not use q8 it is too noisy to have any value")
         model = torch.quantization.quantize_dynamic(
             model, {torch.nn.Linear}, dtype=torch.qint8
         )
