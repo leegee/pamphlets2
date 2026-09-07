@@ -1,6 +1,9 @@
-# tier1/db_observation_backend.py
-
 from typing import Sequence
+
+from psycopg import Connection
+
+from lib.corpus_logging import logger
+
 
 EVENT_COLUMNS = (
     "event_id",
@@ -24,6 +27,10 @@ def create_events_table(conn: Connection) -> None:
 
     event_id is the stable identity shared by PostgreSQL and Lance.
     Vector data is deliberately not stored here.
+
+    Multiple events at the same token position are allowed until the
+    existing Parquet data has been checked to establish whether the
+    position is in fact one-to-one with event_id.
     """
     logger.info("[corpus_db] Creating events table")
 
@@ -51,12 +58,9 @@ def create_events_table(conn: Connection) -> None:
                     broad_window_id BIGINT,
                     broad_window_token_pos INTEGER,
 
-                    CONSTRAINT events_position_unique
-                        UNIQUE (corpus, doc_id, token_idx),
-
-                    CONSTRAINT events_document_fk
-                        FOREIGN KEY (doc_id)
-                        REFERENCES documents(doc_id)
+                    CONSTRAINT events_token_fk
+                        FOREIGN KEY (doc_id, token_idx)
+                        REFERENCES tokens(doc_id, token_idx)
                         ON DELETE CASCADE
                 );
             """)
@@ -94,6 +98,29 @@ def drop_events_table(conn: Connection) -> None:
             cur.execute("DROP SEQUENCE IF EXISTS event_id_seq;")
 
     logger.info("[corpus_db] Events table dropped")
+
+
+def sync_event_id_sequence(conn: Connection) -> None:
+    """
+    Move the event ID sequence beyond the highest imported event ID.
+
+    Historical backfill supplies authoritative IDs; subsequent stock
+    population must therefore allocate IDs after those existing events.
+    """
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("SELECT MAX(event_id) FROM events")
+            max_id = cur.fetchone()[0]
+
+            if max_id is None:
+                cur.execute(
+                    "ALTER SEQUENCE event_id_seq RESTART WITH 1"
+                )
+            else:
+                cur.execute(
+                    "SELECT setval('event_id_seq', %s, true)",
+                    (int(max_id),),
+                )
 
 
 def allocate_event_ids(
@@ -202,3 +229,4 @@ def insert_events(
                     broad_window_id[i] if broad_window_id is not None else None,
                     broad_window_token_pos[i] if broad_window_token_pos is not None else None,
                 ))
+
