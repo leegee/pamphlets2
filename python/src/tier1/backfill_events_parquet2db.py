@@ -82,19 +82,18 @@ def iter_partition_rows(
             yield rows
 
 
-def insert_batch(conn, rows: list[tuple]) -> int:
-    """
-    Bulk-insert one metadata batch through the partition staging table.
-
-    Existing event IDs are accepted only when all metadata matches. New
-    events are inserted in one set-based operation.
-    """
+def insert_batch(conn, rows) -> int:
     if not rows:
         return 0
 
     with conn.cursor() as cur:
-        with cur.copy("""
-            COPY event_backfill_stage (
+        # Stage only this batch so the token lookup remains a pairwise
+        # (doc_id, token_idx) match rather than independent ANY() predicates.
+        cur.execute("TRUNCATE event_backfill_stage")
+
+        cur.executemany(
+            """
+            INSERT INTO event_backfill_stage (
                 event_id,
                 corpus,
                 doc_id,
@@ -108,52 +107,54 @@ def insert_batch(conn, rows: list[tuple]) -> int:
                 broad_window_id,
                 broad_window_token_pos
             )
-            FROM STDIN
-        """) as copy:
-            for row in rows:
-                copy.write_row(row)
-
-        cur.execute("""
-            SELECT s.event_id
-            FROM event_backfill_stage s
-            JOIN events e
-              ON e.event_id = s.event_id
-            WHERE (
-                e.corpus,
-                e.doc_id,
-                e.token,
-                e.token_idx,
-                e.pub_year,
-                e.local_window_id,
-                e.local_window_token_pos,
-                e.medium_window_id,
-                e.medium_window_token_pos,
-                e.broad_window_id,
-                e.broad_window_token_pos
-            ) IS DISTINCT FROM (
-                s.corpus,
-                s.doc_id,
-                s.token,
-                s.token_idx,
-                s.pub_year,
-                s.local_window_id,
-                s.local_window_token_pos,
-                s.medium_window_id,
-                s.medium_window_token_pos,
-                s.broad_window_id,
-                s.broad_window_token_pos
+            VALUES (
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s
             )
-            LIMIT 1
-        """)
+            """,
+            rows,
+        )
 
-        conflict = cur.fetchone()
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM event_backfill_stage AS s
+            LEFT JOIN tokens AS t
+              ON t.doc_id = s.doc_id
+             AND t.token_idx = s.token_idx
+            WHERE t.doc_id IS NULL
+            """
+        )
+        stale_count = cur.fetchone()[0]
 
-        if conflict is not None:
-            raise RuntimeError(
-                f"event_id {conflict[0]} already exists with different metadata"
+        if stale_count:
+            cur.execute(
+                """
+                SELECT s.corpus, COUNT(*)
+                FROM event_backfill_stage AS s
+                LEFT JOIN tokens AS t
+                ON t.doc_id = s.doc_id
+                AND t.token_idx = s.token_idx
+                WHERE t.doc_id IS NULL
+                GROUP BY s.corpus
+                ORDER BY COUNT(*) DESC
+                """
             )
 
-        cur.execute("""
+            stale_by_corpus = cur.fetchall()
+
+            details = ", ".join(
+                f"{corpus}={count:,}"
+                for corpus, count in stale_by_corpus
+            )
+
+            print(
+                f"[backfill] skipped {stale_count:,} stale observations "
+                f"(token position not present in tokens): {details}"
+            )
+
+        cur.execute(
+            """
             INSERT INTO events (
                 event_id,
                 corpus,
@@ -181,19 +182,15 @@ def insert_batch(conn, rows: list[tuple]) -> int:
                 s.medium_window_token_pos,
                 s.broad_window_id,
                 s.broad_window_token_pos
-            FROM event_backfill_stage s
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM events e
-                WHERE e.event_id = s.event_id
-            )
-        """)
+            FROM event_backfill_stage AS s
+            JOIN tokens AS t
+              ON t.doc_id = s.doc_id
+             AND t.token_idx = s.token_idx
+            ON CONFLICT (event_id) DO NOTHING
+            """
+        )
 
-        inserted = cur.rowcount
-
-        cur.execute("TRUNCATE event_backfill_stage")
-
-        return inserted
+        return cur.rowcount
 
 
 def backfill_partition(
