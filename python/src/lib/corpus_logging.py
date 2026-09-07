@@ -13,8 +13,7 @@ EmitFn = Callable[[str, str], None]
 
 logger = logging.getLogger("corpus")
 
-if logger.level == logging.NOTSET:
-    level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging_level = getattr(logging, level_name, logging.INFO)
 logger.setLevel(logging_level)
 
@@ -23,8 +22,14 @@ if not logger.handlers:
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
 
+    formatter = logging.Formatter(
+        "%(asctime)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     _h = logging.StreamHandler(sys.stderr)
     _h.setLevel(logging_level)
+    _h.setFormatter(formatter)
     logger.addHandler(_h)
 
     _h = TimedRotatingFileHandler(
@@ -35,6 +40,7 @@ if not logger.handlers:
         encoding="utf-8",
     )
     _h.setLevel(logging.DEBUG)
+    _h.setFormatter(formatter)
     logger.addHandler(_h)
 
 
