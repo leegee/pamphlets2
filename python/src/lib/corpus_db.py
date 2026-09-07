@@ -373,3 +373,80 @@ def analysis_db_connection(db_path):
     con.execute("PRAGMA synchronous=NORMAL;")
     return con
 
+
+def create_events_table(conn: Connection) -> None:
+    """
+    Create the durable observation identity and metadata table.
+
+    event_id is the stable identity shared by PostgreSQL and Lance.
+    Vector data is deliberately not stored here.
+    """
+    logger.info("[corpus_db] Creating events table")
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE SEQUENCE IF NOT EXISTS event_id_seq;
+
+                CREATE TABLE IF NOT EXISTS events (
+                    event_id BIGINT PRIMARY KEY
+                        DEFAULT nextval('event_id_seq'),
+
+                    corpus TEXT NOT NULL,
+                    doc_id TEXT NOT NULL,
+                    token TEXT NOT NULL,
+                    token_idx INTEGER NOT NULL,
+                    pub_year INTEGER,
+
+                    local_window_id BIGINT,
+                    local_window_token_pos INTEGER,
+
+                    medium_window_id BIGINT,
+                    medium_window_token_pos INTEGER,
+
+                    broad_window_id BIGINT,
+                    broad_window_token_pos INTEGER,
+
+                    CONSTRAINT events_position_unique
+                        UNIQUE (corpus, doc_id, token_idx),
+
+                    CONSTRAINT events_document_fk
+                        FOREIGN KEY (doc_id)
+                        REFERENCES documents(doc_id)
+                        ON DELETE CASCADE
+                );
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_events_corpus_doc_token
+                ON events(corpus, doc_id, token_idx);
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_events_doc_token
+                ON events(doc_id, token_idx);
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_events_pub_year
+                ON events(pub_year);
+            """)
+
+    logger.info("[corpus_db] Events table created")
+
+
+def drop_events_table(conn: Connection) -> None:
+    """
+    Drop the event table and its ID sequence.
+
+    This is separate from init_db() because existing Tier 1 observations
+    may need to be backfilled without rebuilding the corpus database.
+    """
+    logger.info("[corpus_db] Dropping events table")
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS events CASCADE;")
+            cur.execute("DROP SEQUENCE IF EXISTS event_id_seq;")
+
+    logger.info("[corpus_db] Events table dropped")

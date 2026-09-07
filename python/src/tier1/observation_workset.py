@@ -199,10 +199,7 @@ class ObservationWorkset:
 
         lookup_started = time.perf_counter()
         lookup = lookup or open_observation_lookup(self.store_path)
-        logger.info(
-            "[tier1] workset: opened observation lookup in %.3fs",
-            time.perf_counter() - lookup_started,
-        )
+        logger.info( "[tier1] workset: opened observation lookup in %.3fs", time.perf_counter() - lookup_started, )
 
         event_started = time.perf_counter()
         occurrence_to_events = lookup.find_event_ids_by_positions(
@@ -225,10 +222,7 @@ class ObservationWorkset:
         )
 
         if not seed_event_ids:
-            raise RuntimeError(
-                "None of the configured seed occurrences are present "
-                "in the existing Tier 1 observation store"
-            )
+            raise RuntimeError( "None of the configured seed occurrences are present in the existing Tier 1 observation store" )
 
         available_years = {
             int(year)
@@ -236,9 +230,7 @@ class ObservationWorkset:
         }
 
         if not available_years:
-            raise RuntimeError(
-                "Existing Tier 1 observation store contains no publication years"
-            )
+            raise RuntimeError( "Existing Tier 1 observation store contains no publication years" )
 
         lance_started = time.perf_counter()
 
@@ -248,10 +240,7 @@ class ObservationWorkset:
             nprobes=self.nprobes,
         )
 
-        logger.info(
-            "[tier1] workset: opened Lance store in %.3fs",
-            time.perf_counter() - lance_started,
-        )
+        logger.info( "[tier1] workset: opened Lance store in %.3fs", time.perf_counter() - lance_started, )
 
         index_started = time.perf_counter()
 
@@ -262,12 +251,8 @@ class ObservationWorkset:
 
         indexes = lance_store.get(search_space)
 
-        logger.info(
-            "[tier1] workset: resolved search indexes in %.3fs",
-            time.perf_counter() - index_started,
-        )
+        logger.info( "[tier1] workset: resolved search indexes in %.3fs", time.perf_counter() - index_started, )
 
-        #
         query_started = time.perf_counter()
         scale_vectors: dict[str, np.ndarray] = {}
 
@@ -302,10 +287,7 @@ class ObservationWorkset:
             SCALES,
             DEFAULT_ENSEMBLE_WEIGHTS,
         ):
-            queries += (
-                np.float32(weight)
-                * scale_vectors[scale]
-            )
+            queries += ( np.float32(weight) * scale_vectors[scale] )
 
         logger.info(
             "[tier1] workset: assembled %d ensemble query embeddings "
@@ -357,9 +339,7 @@ class ObservationWorkset:
                     k=search_k + 1,
                 )
 
-                scale_timings[scale] = (
-                    time.perf_counter() - scale_started
-                )
+                scale_timings[scale] = ( time.perf_counter() - scale_started )
 
                 for row_idx, seed_event_id in enumerate(batch_ids):
                     fused = per_seed[row_idx]
@@ -607,36 +587,19 @@ def main() -> None:
             logger.info("=" * 70)
             logger.info("[tier1] CONCEPT %s", concept)
             logger.info("=" * 70)
-            logger.info(
-                "[tier1] seeds:                 %d",
-                stats["seeds"],
-            )
-            logger.info(
-                "[tier1] unique neighbours:     %d",
-                stats["unique_neighbour_events"],
-            )
-            logger.info(
-                "[tier1] final workset:          %d",
-                stats["workset"],
-            )
+            logger.info( "[tier1] seeds:                 %d", stats["seeds"] )
+            logger.info( "[tier1] unique neighbours:     %d", stats["unique_neighbour_events"] )
+            logger.info( "[tier1] final workset:          %d", stats["workset"] )
 
             if not stats["neighbours_by_seed"]:
                 continue
 
-            sample_seed_id = next(
-                iter(stats["neighbours_by_seed"])
-            )
+            sample_seed_id = next( iter(stats["neighbours_by_seed"]) )
 
-            seed_metadata = lookup.get_event_metadata(
-                sample_seed_id
-            )
+            seed_metadata = lookup.get_event_metadata( sample_seed_id )
 
             logger.info("")
-            logger.info(
-                "[tier1] SAMPLE SEED: %r (%s)",
-                seed_metadata["token"],
-                seed_metadata["doc_id"],
-            )
+            logger.info( "[tier1] SAMPLE SEED: %r (%s)", seed_metadata["token"], seed_metadata["doc_id"], )
 
             for rank, item in enumerate(
                 stats["neighbours_by_seed"][sample_seed_id][
@@ -644,9 +607,7 @@ def main() -> None:
                 ],
                 start=1,
             ):
-                metadata = lookup.get_event_metadata(
-                    int(item["event_id"])
-                )
+                metadata = lookup.get_event_metadata( int(item["event_id"]) )
 
                 logger.info(
                     "%3d. rrf=%.6f distance_medium=%s token=%r doc=%s",
