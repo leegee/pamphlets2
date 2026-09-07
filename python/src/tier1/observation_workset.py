@@ -1,6 +1,7 @@
 # tier1/observation_workset.py
 from __future__ import annotations
 
+import time
 import argparse
 import unicodedata
 from dataclasses import dataclass
@@ -17,7 +18,11 @@ from lib.corpus_db import get_connection
 from lib.corpus_logging import logger
 from retrieval.lance_observation_index_store import LanceObservationIndexStore
 from retrieval.models import SearchSpace
-from tier1.observation_store_api import SCALES, open_observation_lookup
+from tier1.observation_store_api import (
+    DEFAULT_ENSEMBLE_WEIGHTS,
+    SCALES,
+    open_observation_lookup,
+)
 
 # These are deliberately the same retrieval parameters used by the current
 # multiscale Lance search. They determine the candidate population, not a
@@ -190,8 +195,16 @@ class ObservationWorkset:
         if not seed_occurrences:
             return set(), {}
 
-        lookup = lookup or open_observation_lookup( self.store_path )
+        expand_started = time.perf_counter()
 
+        lookup_started = time.perf_counter()
+        lookup = lookup or open_observation_lookup(self.store_path)
+        logger.info(
+            "[tier1] workset: opened observation lookup in %.3fs",
+            time.perf_counter() - lookup_started,
+        )
+
+        event_started = time.perf_counter()
         occurrence_to_events = lookup.find_event_ids_by_positions(
             sorted(seed_occurrences)
         )
@@ -204,17 +217,18 @@ class ObservationWorkset:
             }
         )
 
+        logger.info(
+            "[tier1] workset: resolved %d occurrences -> %d events in %.3fs",
+            len(seed_occurrences),
+            len(seed_event_ids),
+            time.perf_counter() - event_started,
+        )
+
         if not seed_event_ids:
             raise RuntimeError(
                 "None of the configured seed occurrences are present "
                 "in the existing Tier 1 observation store"
             )
-
-        logger.info(
-            "[tier1] seed occurrences=%d -> seed events=%d",
-            len(seed_occurrences),
-            len(seed_event_ids),
-        )
 
         available_years = {
             int(year)
@@ -226,52 +240,125 @@ class ObservationWorkset:
                 "Existing Tier 1 observation store contains no publication years"
             )
 
+        lance_started = time.perf_counter()
+
         lance_store = lance_store or LanceObservationIndexStore(
             self.lance_root,
             available_years=available_years,
             nprobes=self.nprobes,
         )
 
+        logger.info(
+            "[tier1] workset: opened Lance store in %.3fs",
+            time.perf_counter() - lance_started,
+        )
+
+        index_started = time.perf_counter()
+
         search_space = SearchSpace(
-            years=tuple(sorted(available_years)),
+            years=None,
             scale=SCALES,
         )
 
         indexes = lance_store.get(search_space)
 
-        seed_positions = [
-            lookup.get_pos(event_id)
-            for event_id in seed_event_ids
-        ]
+        logger.info(
+            "[tier1] workset: resolved search indexes in %.3fs",
+            time.perf_counter() - index_started,
+        )
 
-        queries = lookup.get_embeddings(seed_event_ids)
+        #
+        query_started = time.perf_counter()
+        scale_vectors: dict[str, np.ndarray] = {}
+
+        for scale in SCALES:
+            scale_started = time.perf_counter()
+
+            vectors = indexes[scale].reconstruct_many(seed_event_ids)
+
+            if vectors.shape != (len(seed_event_ids), 768):
+                raise RuntimeError(
+                    f"Lance reconstruction for scale={scale!r} returned "
+                    f"shape {vectors.shape}; expected "
+                    f"({len(seed_event_ids)}, 768)"
+                )
+
+            scale_vectors[scale] = vectors
+
+            logger.info(
+                "[tier1] workset: reconstructed %d %s query embeddings "
+                "from Lance in %.3fs",
+                len(seed_event_ids),
+                scale,
+                time.perf_counter() - scale_started,
+            )
+
+        queries = np.zeros(
+            (len(seed_event_ids), 768),
+            dtype=np.float32,
+        )
+
+        for scale, weight in zip(
+            SCALES,
+            DEFAULT_ENSEMBLE_WEIGHTS,
+        ):
+            queries += (
+                np.float32(weight)
+                * scale_vectors[scale]
+            )
+
+        logger.info(
+            "[tier1] workset: assembled %d ensemble query embeddings "
+            "from Lance in %.3fs",
+            len(queries),
+            time.perf_counter() - query_started,
+        )
 
         if len(queries) != len(seed_event_ids):
             raise RuntimeError(
-                "Tier 1 lookup returned a different number of query vectors "
-                "than seed event IDs"
+                "Lance reconstruction returned a different number of "
+                "query vectors than seed event IDs"
             )
 
         neighbours_by_seed: dict[int, list[dict]] = {}
         neighbour_event_ids: set[int] = set()
 
         search_k = self.top_k * self.oversample
+        batch_size = 32
+        total_batches = (
+            len(seed_event_ids) + batch_size - 1
+        ) // batch_size
 
-        for start in range(0, len(seed_event_ids), 32):
-            batch_ids = seed_event_ids[start:start + 32]
-            batch_queries = queries[start:start + 32]
+        retrieval_started = time.perf_counter()
+
+        for batch_number, start in enumerate(
+            range(0, len(seed_event_ids), batch_size),
+            start=1,
+        ):
+            batch_started = time.perf_counter()
+
+            batch_ids = seed_event_ids[start:start + batch_size]
+            batch_queries = queries[start:start + batch_size]
 
             per_seed: list[dict[int, dict]] = [
                 {}
                 for _ in batch_ids
             ]
 
+            scale_timings: dict[str, float] = {}
+
             for scale in SCALES:
+                scale_started = time.perf_counter()
+
                 index = indexes[scale]
 
                 results = index.batch_search(
                     batch_queries,
                     k=search_k + 1,
+                )
+
+                scale_timings[scale] = (
+                    time.perf_counter() - scale_started
                 )
 
                 for row_idx, seed_event_id in enumerate(batch_ids):
@@ -322,11 +409,41 @@ class ObservationWorkset:
                         int(item["event_id"])
                     )
 
-            logger.info(
-                "[tier1] semantic expansion: %d/%d seeds",
-                min(start + len(batch_ids), len(seed_event_ids)),
+            batch_elapsed = time.perf_counter() - batch_started
+            retrieval_elapsed = time.perf_counter() - retrieval_started
+
+            completed = min(
+                start + len(batch_ids),
                 len(seed_event_ids),
             )
+
+            rate = completed / retrieval_elapsed
+            remaining = len(seed_event_ids) - completed
+            eta = remaining / rate if rate > 0 else 0.0
+
+            logger.info(
+                "[tier1] batch %d/%d: seeds=%d elapsed=%.3fs "
+                "local=%.3fs medium=%.3fs broad=%.3fs "
+                "rate=%.2f seeds/s ETA=%.1fs",
+                batch_number,
+                total_batches,
+                len(batch_ids),
+                batch_elapsed,
+                scale_timings.get("local", 0.0),
+                scale_timings.get("medium", 0.0),
+                scale_timings.get("broad", 0.0),
+                rate,
+                eta,
+            )
+
+        logger.info(
+            "[tier1] semantic expansion complete: "
+            "%d seeds in %.3fs",
+            len(seed_event_ids),
+            time.perf_counter() - retrieval_started,
+        )
+
+        metadata_started = time.perf_counter()
 
         neighbour_occurrences: set[Occurrence] = set()
 
@@ -341,10 +458,24 @@ class ObservationWorkset:
                 )
             )
 
+        logger.info(
+            "[tier1] workset: resolved %d neighbour events -> "
+            "%d occurrences in %.3fs",
+            len(neighbour_event_ids),
+            len(neighbour_occurrences),
+            time.perf_counter() - metadata_started,
+        )
+
         workset = set(seed_occurrences)
         workset.update(neighbour_occurrences)
 
+        logger.info(
+            "[tier1] workset expansion total time %.3fs",
+            time.perf_counter() - expand_started,
+        )
+
         return workset, neighbours_by_seed
+
 
     def build(
         self,

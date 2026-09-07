@@ -49,35 +49,25 @@ class SearchSpace:
                 )
             elif isinstance(self.years, tuple):
                 if len(self.years) != 2:
-                    raise ValueError(
-                        "year range must contain exactly two years"
-                    )
+                    raise ValueError( f"year range must contain exactly two years not {self.years}" )
 
                 if not all(
                     isinstance(year, int)
                     for year in self.years
                 ):
-                    raise TypeError(
-                        "year range must contain integers"
-                    )
+                    raise TypeError( "year range must contain integers" )
 
                 start, end = self.years
 
                 if start > end:
-                    raise ValueError(
-                        "year range must be in ascending order"
-                    )
+                    raise ValueError( "year range must be in ascending order" )
             else:
-                raise TypeError(
-                    "years must be an int or a two-year tuple"
-                )
+                raise TypeError( "years must be an int or a two-year tuple" )
 
         if self.scale is not None:
             if isinstance(self.scale, str):
                 if self.scale not in self._VALID_SCALES:
-                    raise ValueError(
-                        f"invalid scales: {[self.scale]}"
-                    )
+                    raise ValueError( f"invalid scales: {[self.scale]}" )
 
                 object.__setattr__(
                     self,
@@ -86,28 +76,21 @@ class SearchSpace:
                 )
             elif isinstance(self.scale, tuple):
                 if not self.scale:
-                    raise ValueError(
-                        "scale selection must contain at least one scale"
-                    )
+                    raise ValueError( "scale selection must contain at least one scale" )
 
                 if not all(
                     isinstance(scale, str)
                     for scale in self.scale
                 ):
-                    raise TypeError(
-                        "scale selection must contain strings"
-                    )
+                    raise TypeError( "scale selection must contain strings" )
 
                 invalid = set(self.scale) - self._VALID_SCALES
 
                 if invalid:
-                    raise ValueError(
-                        f"invalid scales: {sorted(invalid)}"
-                    )
+                    raise ValueError( f"invalid scales: {sorted(invalid)}" )
             else:
-                raise TypeError(
-                    "scale must be a string or tuple of strings"
-                )
+                raise TypeError( "scale must be a string or tuple of strings" )
+
 
     def buckets(
         self,
@@ -125,19 +108,13 @@ class SearchSpace:
             finite chronological interval to divide into buckets.
         """
         if self.years is None:
-            raise ValueError(
-                "bucket traversal requires an explicit year range"
-            )
+            raise ValueError( "bucket traversal requires an explicit year range" )
 
         if not isinstance(bucket_size, int) or bucket_size <= 0:
-            raise ValueError(
-                "bucket_size must be a positive integer"
-            )
+            raise ValueError( "bucket_size must be a positive integer" )
 
         if direction not in ("forward", "backward"):
-            raise ValueError(
-                f"invalid direction: {direction!r}"
-            )
+            raise ValueError( f"invalid direction: {direction!r}" )
 
         start, end = self.years
 
@@ -198,6 +175,8 @@ class SearchSpace:
         Failure mode:
             Requested scales without a corresponding search index are
             excluded rather than causing an unrelated scale to be used.
+
+        TODO Reference the SCALES constant wherever it now lives
         """
         available = set(available_scales)
 
@@ -228,9 +207,7 @@ class SearchResult:
 
     def __post_init__(self) -> None:
         if self.event_ids.shape != self.distances.shape:
-            raise ValueError(
-                "event_ids and distances must have identical shapes"
-            )
+            raise ValueError( "event_ids and distances must have identical shapes" )
 
 
 @dataclass(slots=True)
@@ -242,19 +219,13 @@ class BatchSearchResult:
 
     def __post_init__(self) -> None:
         if self.event_ids.ndim != 2:
-            raise ValueError(
-                "batch event_ids must be two-dimensional"
-            )
+            raise ValueError( "batch event_ids must be two-dimensional" )
 
         if self.distances.ndim != 2:
-            raise ValueError(
-                "batch distances must be two-dimensional"
-            )
+            raise ValueError( "batch distances must be two-dimensional" )
 
         if self.event_ids.shape != self.distances.shape:
-            raise ValueError(
-                "batch event_ids and distances must have identical shapes"
-            )
+            raise ValueError( "batch event_ids and distances must have identical shapes" )
 
     def row(self, index: int) -> SearchResult:
         return SearchResult(

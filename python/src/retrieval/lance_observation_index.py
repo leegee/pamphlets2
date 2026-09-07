@@ -114,8 +114,10 @@ class LanceObservationIndex(ObservationIndex):
         if len(converted.event_ids) <= k:
             return converted
 
+        # Lance distance is lower-is-better; negating it would select the worst
+        # candidates when multiple tables are merged above.
         order = np.argsort(
-            -converted.distances,
+            converted.distances,
             kind="stable",
         )[:k]
 
@@ -132,18 +134,15 @@ class LanceObservationIndex(ObservationIndex):
         oversample: int = 1,
     ) -> BatchSearchResult:
         """
-        Search each query independently.
+        Search all queries in each Lance table using LanceDB's native
+        multi-query search API, then merge the chronological table results.
 
-        The installed LanceDB path currently used by this project does not
-        provide a backend-independent rectangular multi-query contract, so
-        this deliberately falls back to repeated single-query searches.
-
-        `oversample` belongs here because callers such as multiscale RRF
-        need a larger candidate set than the final result count.
+        LanceDB returns a query_index for each result row. That index is the
+        invariant linking a result back to its input query; losing it would
+        silently associate neighbours with the wrong seed.
         """
         if k <= 0:
             raise ValueError("k must be positive")
-
         if oversample <= 0:
             raise ValueError("oversample must be positive")
 
@@ -152,14 +151,8 @@ class LanceObservationIndex(ObservationIndex):
 
         if query_count == 0:
             return BatchSearchResult(
-                event_ids=np.empty(
-                    (0, 0),
-                    dtype=np.uint64,
-                ),
-                distances=np.empty(
-                    (0, 0),
-                    dtype=np.float32,
-                ),
+                event_ids=np.empty((0, 0), dtype=np.uint64),
+                distances=np.empty((0, 0), dtype=np.float32),
             )
 
         search_k = k * oversample
@@ -175,18 +168,47 @@ class LanceObservationIndex(ObservationIndex):
             self._year_end,
         )
 
-        results = [
-            self.search(
-                query,
-                k=search_k,
-            )
-            for query in query_array
+        per_query: list[list[tuple[int, float]]] = [
+            []
+            for _ in range(query_count)
         ]
 
-        width = min(
-            len(result.event_ids)
-            for result in results
-        )
+        for table in self._tables:
+            request = (
+                table
+                .search(
+                    query_array,
+                    vector_column_name="vector",
+                )
+                .nprobes(self._nprobes)
+                .limit(search_k)
+                .select(["event_id", "_distance"])
+            )
+
+            request = self._apply_filter(request, prefilter=True)
+            rows = request.to_list()
+
+            for row in rows:
+                query_index = int(row["query_index"])
+                event_id = int(row["event_id"])
+                distance = float(row["_distance"])
+
+                if not 0 <= query_index < query_count:
+                    raise RuntimeError(
+                        f"Lance returned invalid query_index={query_index} "
+                        f"for {query_count} queries"
+                    )
+
+                per_query[query_index].append(
+                    (event_id, distance)
+                )
+
+        widths = [
+            min(k, len(rows))
+            for rows in per_query
+        ]
+
+        width = min(widths, default=0)
 
         if width == 0:
             return BatchSearchResult(
@@ -204,20 +226,31 @@ class LanceObservationIndex(ObservationIndex):
             (query_count, width),
             dtype=np.uint64,
         )
-
         distances = np.empty(
             (query_count, width),
             dtype=np.float32,
         )
 
-        for query_index, result in enumerate(results):
-            event_ids[query_index] = result.event_ids[:width]
-            distances[query_index] = result.distances[:width]
+        for query_index, rows in enumerate(per_query):
+            # Lance distance is lower-is-better.
+            rows.sort(key=lambda item: item[1])
+
+            selected = rows[:width]
+
+            event_ids[query_index] = [
+                event_id
+                for event_id, _ in selected
+            ]
+            distances[query_index] = [
+                distance
+                for _, distance in selected
+            ]
 
         return BatchSearchResult(
             event_ids=event_ids,
             distances=distances,
         )
+
 
     def reconstruct(
         self,

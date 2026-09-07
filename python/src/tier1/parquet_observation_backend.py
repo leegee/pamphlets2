@@ -1126,6 +1126,7 @@ class ParquetObservationLookup:
             any_year = next(iter(index.values()))
             self._dim = next(iter(any_year.values())).dim
 
+
     def _ensure_dim(self) -> int:
         if self._dim is not None:
             return self._dim
@@ -1134,6 +1135,7 @@ class ParquetObservationLookup:
             return 0
         self._dim = _probe_dim(self._con, self._files_sql)
         return self._dim
+
 
     def _fetch_scale_from_parquet(
         self, event_ids: Sequence[int], scale: str
@@ -1196,6 +1198,154 @@ class ParquetObservationLookup:
                 cache[eid] = arr
 
         return out
+
+
+    def _fetch_scales_from_parquet(
+        self,
+        event_ids: Sequence[int],
+        scales: Sequence[str],
+    ) -> dict[str, np.ndarray]:
+        """
+        Fetch several embedding scales for the same event IDs in one Parquet
+        scan and return each scale aligned to the caller's event_id order.
+
+        The event metadata is already resident in memory, so publication years
+        can be used to prune the hive-partitioned Parquet tree. Fetching all
+        requested scales together also avoids scanning the observation store
+        once per scale.
+        """
+        scales = _validate_scales(scales)
+
+        if not scales:
+            return {}
+
+        event_ids = [int(eid) for eid in event_ids]
+        n = len(event_ids)
+
+        dim = self._ensure_dim()
+
+        outputs = {
+            scale: np.empty((n, dim), dtype=np.float32)
+            for scale in scales
+        }
+
+        if not event_ids:
+            return outputs
+
+        missing_by_scale: dict[str, list[int]] = {
+            scale: [] for scale in scales
+        }
+        missing_positions_by_scale: dict[str, list[int]] = {
+            scale: [] for scale in scales
+        }
+
+        for position, eid in enumerate(event_ids):
+            for scale in scales:
+                cached = self._emb_cache[scale].get(eid)
+                if cached is not None:
+                    outputs[scale][position] = cached
+                else:
+                    missing_by_scale[scale].append(eid)
+                    missing_positions_by_scale[scale].append(position)
+
+        scales_to_fetch = [
+            scale
+            for scale in scales
+            if missing_by_scale[scale]
+        ]
+
+        if not scales_to_fetch:
+            return outputs
+
+        missing_ids = sorted({
+            eid
+            for scale in scales_to_fetch
+            for eid in missing_by_scale[scale]
+        })
+
+        positions = [
+            self.get_pos(eid)
+            for eid in missing_ids
+        ]
+        years = sorted({
+            int(self.pub_year[pos])
+            for pos in positions
+        })
+
+        id_placeholders = ",".join("?" for _ in missing_ids)
+        year_placeholders = ",".join("?" for _ in years)
+
+        embedding_columns = ", ".join(
+            f"emb_{scale}"
+            for scale in scales_to_fetch
+        )
+
+        sql = f"""
+            SELECT event_id, {embedding_columns}
+            FROM read_parquet(
+                {self._files_sql},
+                hive_partitioning=true,
+                union_by_name=true
+            )
+            WHERE year IN ({year_placeholders})
+            AND event_id IN ({id_placeholders})
+        """
+
+        rows = self._con.execute(
+            sql,
+            [*years, *missing_ids],
+        ).fetchall()
+
+        by_id = {
+            int(row[0]): row[1:]
+            for row in rows
+        }
+
+        if len(by_id) != len(missing_ids):
+            missing = [
+                eid
+                for eid in missing_ids
+                if eid not in by_id
+            ]
+            raise KeyError(
+                f"{len(missing)} requested event IDs were not found "
+                f"in parquet store; examples={missing[:10]}"
+            )
+
+        for row_index, eid in enumerate(missing_ids):
+            values = by_id[eid]
+
+            for column_index, scale in enumerate(scales_to_fetch):
+                vec = values[column_index]
+
+                if vec is None:
+                    raise KeyError(
+                        f"scale {scale!r} was not computed for event_id={eid} "
+                        f"(embedding is null in the store)"
+                    )
+
+                arr = np.asarray(vec, dtype=np.float32)
+
+                if arr.shape != (dim,):
+                    raise ValueError(
+                        f"scale {scale!r} for event_id={eid} has shape "
+                        f"{arr.shape}, expected ({dim},)"
+                    )
+
+                self._emb_cache[scale][eid] = arr
+
+        for scale in scales_to_fetch:
+            cache = self._emb_cache[scale]
+
+            if len(cache) > self._emb_cache_max:
+                cache.clear()
+
+            for position in missing_positions_by_scale[scale]:
+                eid = event_ids[position]
+                outputs[scale][position] = cache[eid]
+
+        return outputs
+
 
     def _fetch_scale_from_faiss(
         self, event_ids: Sequence[int], scale: str
@@ -1269,6 +1419,7 @@ class ParquetObservationLookup:
             )
         eid = int(self.event_id[pos])
         out: Optional[np.ndarray] = None
+        # TODO optimize
         for w, s in zip(weights, scales):
             vec = self._scale_for_ids([eid], s)[0]
             out = w * vec if out is None else out + w * vec
@@ -1284,17 +1435,30 @@ class ParquetObservationLookup:
         scales = _validate_scales(scales)
 
         if len(weights) != len(scales):
-            raise ValueError( f"weights length {len(weights)} != scales length {len(scales)}" )
+            raise ValueError(
+                f"weights length {len(weights)} != scales length {len(scales)}"
+            )
 
-        out: Optional[np.ndarray] = None
+        if not scales:
+            return np.empty(
+                (len(event_ids), self._ensure_dim()),
+                dtype=np.float32,
+            )
 
-        for w, s in zip(weights, scales):
-            mat = self._scale_for_ids(event_ids, s)
-            out = w * mat if out is None else out + w * mat
+        matrices = self._fetch_scales_from_parquet(
+            event_ids,
+            scales,
+        )
 
-        if out is None:
-            return np.empty((len(event_ids), self._ensure_dim()), dtype=np.float32)
-        return out.astype(np.float32)
+        out = np.zeros(
+            (len(event_ids), self._ensure_dim()),
+            dtype=np.float32,
+        )
+
+        for weight, scale in zip(weights, scales):
+            out += weight * matrices[scale]
+
+        return out
 
 
     def get_concatenated_embeddings(
@@ -1309,6 +1473,7 @@ class ParquetObservationLookup:
             norms[norms == 0] = 1.0
             return M / norms
 
+        # TODO Optimize
         blocks = [_norm_rows(self._scale_for_ids(event_ids, s)) for s in scales]
         return np.concatenate(blocks, axis=1).astype(np.float32)
 
