@@ -11,8 +11,8 @@ from retrieval.lance_observation_index_store import (
     LanceObservationIndexStore,
 )
 from retrieval.models import SearchSpace
+from retrieval.models import SCALES
 from tier1.observation_store_api import (
-    SCALES,
     open_observation_lookup,
 )
 

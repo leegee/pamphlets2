@@ -8,7 +8,7 @@ import lancedb
 import numpy as np
 
 from lib.corpus_logging import logger
-from tier1.observation_store_api import SCALES
+from retrieval.models import SCALES
 from lib.corpus_config import (
     CORPUS_MAX_YEAR,
     CORPUS_MIN_YEAR,

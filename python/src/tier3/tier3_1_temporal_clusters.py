@@ -26,7 +26,7 @@ from lib.corpus_db import analysis_db_connection
 from lib.concept_resolve import resolve_concepts
 from lib.corpus_logging import logger
 from lib.sqlite_vector_blob import vector_to_blob
-
+from retrieval.models import SCALES
 from lib.cluster import (
     LOCAL_UMAP_PARAMS,
     build_global_projection,
@@ -36,7 +36,6 @@ from lib.cluster import (
 )
 
 from tier1.observation_store_api import (
-    SCALES,
     open_observation_lookup,
 )
 

@@ -7,9 +7,7 @@ import lancedb
 
 from lib.corpus_db import get_connection
 from lib.corpus_config import LANCE_INDEXES_DIR
-
-
-SCALES = ("local", "medium", "broad")
+from retrieval.models import SCALES
 
 
 def lance_table_name(scale: str, start: int, end: int) -> str:

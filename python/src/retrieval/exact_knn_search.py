@@ -46,11 +46,11 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Literal, Optional, Sequence
-
+from retrieval.models import SCALES
 import numpy as np
 import pyarrow.parquet as pq
 
-ScaleName = Literal["local", "medium", "broad", "ensemble"]
+ScaleName = Literal[SCALES]
 DEFAULT_WEIGHTS = (0.25, 0.50, 0.25)
 
 _YEAR_RE = re.compile(r"year=(\d+)$")
@@ -523,7 +523,7 @@ def multiscale_exact_search(
     positions = np.asarray(positions, dtype=np.int64)
     n_queries = len(positions)
     search_k = top_n * oversample
-    scales: tuple[ScaleName, ...] = ("local", "medium", "broad")
+    scales: tuple[ScaleName, ...] = SCALES
 
     all_shards = list(shards) if shards is not None else discover_shards(store_root)
     year_filter = [pub_year] if pub_year is not None else None

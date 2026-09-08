@@ -4,8 +4,7 @@ from pathlib import Path
 
 from lib.corpus_logging import logger
 from retrieval.diskann_observation_index import DiskANNObservationIndex
-
-SCALES = ("local", "medium", "broad")
+from retrieval.models import SCALES
 
 
 DIMENSIONS = 768

@@ -1,5 +1,15 @@
 """
-tier2/run_lance.py
+Tier 2 command-line runner.
+
+This module owns orchestration only.
+
+PostgreSQL is authoritative for Tier 1 event identity and provenance.
+Lance is authoritative for embedding geometry.
+The retrieval algorithm itself lives in tier2.analysis.
+
+Failure mode:
+    Tier 2 must not silently compensate for a broken Tier 1
+    PostgreSQL/Lance completeness invariant.
 """
 
 from __future__ import annotations
@@ -11,18 +21,14 @@ from pathlib import Path
 from lib.corpus_config import (
     CONCEPT_SETS,
     CORPUS_TIER2_DB_PATH,
-    EVENTSTORE_T1_PATH,
     LANCE_INDEXES_DIR,
 )
+from lib.corpus_db import get_connection
 from lib.corpus_logging import logger
 from retrieval.lance_observation_index_store import (
     LanceObservationIndexStore,
 )
-from retrieval.models import SearchSpace
-from tier1.observation_store_api import (
-    SCALES,
-    open_observation_lookup,
-)
+from retrieval.models import SCALES, SearchSpace
 from tier2.analysis import (
     BATCH_SIZE,
     K,
@@ -34,27 +40,71 @@ from tier2.analysis import (
 from tier2.sqlite import write_tier2_sqlite
 
 
+def _available_event_years(connection) -> tuple[int, ...]:
+    """
+    Discover years from the current Tier 1 event universe.
+
+    PostgreSQL is authoritative here; Lance may still contain legacy
+    orphaned observations outside the current Tier 1 universe.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT DISTINCT pub_year
+            FROM events
+            WHERE pub_year IS NOT NULL
+            ORDER BY pub_year
+            """
+        )
+
+        return tuple(
+            int(row[0])
+            for row in cursor.fetchall()
+        )
+
+
+def _year_range(
+    from_year: int | None,
+    to_year: int | None,
+) -> tuple[int, int] | None:
+    if from_year is None and to_year is None:
+        return None
+
+    if from_year is None:
+        return to_year, to_year
+
+    if to_year is None:
+        return from_year, from_year
+
+    return from_year, to_year
+
+
 def _resolve_search_scope(
     search_space: SearchSpace,
-    lookup,
-    scales=SCALES,
-) -> tuple[
-    tuple[int, ...],
-    tuple[str, ...],
-    int | None,
-    int | None,
-]:
-    available_years = {
+    available_years: tuple[int, ...],
+):
+    available_years_set = {
         int(year)
-        for year in lookup.available_years
+        for year in available_years
     }
 
-    candidate_years = tuple(
-        search_space.resolve_years(available_years)
-    )
+    if search_space.years is None:
+        candidate_years = tuple(
+            sorted(available_years_set)
+        )
+    else:
+        start, end = search_space.years
+
+        candidate_years = tuple(
+            year
+            for year in sorted(available_years_set)
+            if start <= year <= end
+        )
 
     scales = tuple(
-        search_space.resolve_scales(set(scales))
+        search_space.resolve_scales(
+            set(SCALES)
+        )
     )
 
     if not scales:
@@ -67,32 +117,63 @@ def _resolve_search_scope(
             "[tier2] SearchSpace resolves to no searchable years"
         )
 
-    year_start = (
-        min(candidate_years)
-        if candidate_years
-        else None
+    return candidate_years, scales
+
+
+
+def _build_indexes_by_year(
+    *,
+    lance_root: str | Path,
+    candidate_years: tuple[int, ...],
+    scales: tuple[str, ...],
+):
+    """
+    Build one logical Lance index set per publication year.
+
+    The physical Lance tables remain chronological 50-year buckets. The
+    observation index store maps a single publication year onto the
+    physical bucket containing that year.
+
+    This preserves the Tier 2 invariant that a seed from year Y is searched
+    only against observations from year Y.
+    """
+    store = LanceObservationIndexStore(
+        lance_root,
+        available_years=candidate_years,
+        available_scales=scales,
     )
 
-    year_end = (
-        max(candidate_years)
-        if candidate_years
-        else None
-    )
+    indexes_by_year = {}
 
-    return (
-        candidate_years,
-        scales,
-        year_start,
-        year_end,
-    )
+    for year in candidate_years:
+        indexes = store.get(
+            SearchSpace(
+                years=(year, year),
+                scale=None,
+            )
+        )
+
+        missing_scales = set(scales) - set(indexes)
+
+        if missing_scales:
+            raise RuntimeError(
+                f"Missing Lance scale(s) for publication year "
+                f"{year}: {sorted(missing_scales)}"
+            )
+
+        indexes_by_year[int(year)] = indexes
+
+    return indexes_by_year
 
 
 def run_lance_tier2(
     *,
+    connection,
     concept_name: str,
     concept: dict,
-    search_space: SearchSpace | None = None,
-    store_path: str | Path = EVENTSTORE_T1_PATH,
+    indexes_by_year,
+    candidate_years: tuple[int, ...],
+    scales: tuple[str, ...],
     sqlite_path: str | Path = CORPUS_TIER2_DB_PATH,
     top_n: int = K,
     rrf_k: int = RRF_K,
@@ -100,81 +181,15 @@ def run_lance_tier2(
     batch_size: int = BATCH_SIZE,
     false_positives: list[str] | None = None,
     clear: bool = False,
-    lookup=None,
-    indexes_by_year=None,
-    candidate_years: tuple[int, ...] | None = None,
-    scales: tuple[str, ...] | None = None,
-    year_start: int | None = None,
-    year_end: int | None = None,
 ) -> Path:
     """
-    Run Tier 2 semantic neighbourhood analysis using LanceDB.
+    Run one concept and persist its Tier 2 result.
 
-    Tier 1 remains the source of truth for observation identity and
-    provenance. Lance supplies approximate nearest-neighbour geometry.
-
-    Lance tables cover the whole corpus physically. Temporal restriction is
-    represented by one logical LanceObservationIndex per candidate year.
-
-    Each seed event is therefore searched only against observations from
-    the seed event's publication year.
-
-    The observation lookup and temporal Lance indexes are shared between
-    concepts by the CLI.
-
-    Failure modes:
-        Missing temporal indexes are rejected before search because a
-        seed must never silently fall back to a broader temporal scope.
-
-        The complete result set is accumulated in memory before the SQLite
-        transaction. This is intentionally retained for compatibility with
-        the existing analysis layer; streaming persistence can be introduced
-        after downstream consumers have been checked.
+    Retrieval remains in tier2.analysis. This function only resolves the
+    workset, consumes batches, and hands the completed result to the
+    established SQLite export layer.
     """
     started = time.perf_counter()
-
-    if search_space is None:
-        search_space = SearchSpace(
-            years=None,
-            scale=None,
-        )
-
-    if lookup is None:
-        lookup = open_observation_lookup(
-            store_path
-        )
-
-    if (
-        candidate_years is None
-        or scales is None
-        or year_start is None
-        or year_end is None
-    ):
-        (
-            candidate_years,
-            scales,
-            year_start,
-            year_end,
-        ) = _resolve_search_scope(
-            search_space,
-            lookup,
-            scales or SCALES,
-        )
-
-    if indexes_by_year is None:
-        raise ValueError(
-            "indexes_by_year must be supplied"
-        )
-
-    missing_years = set(candidate_years) - set(
-        indexes_by_year
-    )
-
-    if missing_years:
-        raise RuntimeError(
-            "Missing temporal indexes for years: "
-            f"{sorted(missing_years)}"
-        )
 
     logger.info(
         "[tier2] resolving concept=%s",
@@ -184,9 +199,9 @@ def run_lance_tier2(
     resolve_started = time.perf_counter()
 
     resolved = resolve_concept_positions(
+        connection=connection,
         concept_name=concept_name,
         concept=concept,
-        lookup=lookup,
         false_positives=false_positives,
     )
 
@@ -208,8 +223,8 @@ def run_lance_tier2(
     logger.info(
         "[tier2] query workset: %d seed events, search years=%s-%s",
         len(seed_ids),
-        year_start,
-        year_end,
+        min(candidate_years) if candidate_years else None,
+        max(candidate_years) if candidate_years else None,
     )
 
     output_events = []
@@ -218,14 +233,14 @@ def run_lance_tier2(
     batch_count = 0
 
     for batch in iter_concept_batches(
-        lookup=lookup,
+        connection=connection,
         indexes_by_year=indexes_by_year,
         seed_event_ids=seed_ids,
         scales=scales,
         top_n=top_n,
         rrf_k=rrf_k,
         oversample=oversample,
-        false_positives=false_positives,
+        false_positives=resolved["false_positives"],
         batch_size=batch_size,
     ):
         output_events.extend(
@@ -283,82 +298,86 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--clear",
-        action="store_true",
-        help="Clear the Tier 2 SQLite database before processing.",
+        "--concept",
+        help="Run only this concept. Default: all CONCEPT_SETS entries.",
     )
 
     parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="Clear Tier 2 SQLite output before the first concept.",
+    )
+
+    parser.add_argument(
+        "-k",
         "--k",
         type=int,
         default=K,
-        help="K nearest neighbours.",
+        help=f"Number of neighbours per seed (default: {K}).",
+    )
+
+    parser.add_argument(
+        "--rrf-k",
+        type=int,
+        default=RRF_K,
+        help=f"RRF constant (default: {RRF_K}).",
     )
 
     parser.add_argument(
         "--oversample",
         type=int,
         default=OVERSAMPLE,
-        help="K nearest neighbours oversample.",
+        help=f"ANN oversampling factor (default: {OVERSAMPLE}).",
     )
 
     parser.add_argument(
-        "--concept",
-        help="Run only this concept. Default: all CONCEPT_SETS entries.",
+        "--batch-size",
+        type=int,
+        default=BATCH_SIZE,
+        help=f"Seed batch size (default: {BATCH_SIZE}).",
     )
 
     parser.add_argument(
-        "--scale",
-        choices=SCALES,
-        action="append",
-        help=(
-            "Scale to build. May be supplied multiple times. "
-            "Defaults to all scales."
-        ),
-    )
-
-    parser.add_argument(
-        "--sqlite",
-        type=Path,
-        default=CORPUS_TIER2_DB_PATH,
-        help=(
-            f"Tier 2 SQLite database "
-            f"(default: {CORPUS_TIER2_DB_PATH})."
-        ),
-    )
-
-    parser.add_argument(
-        "--lance",
-        type=Path,
-        default=LANCE_INDEXES_DIR,
-        help=(
-            f"Lance database root "
-            f"(default: {LANCE_INDEXES_DIR})."
-        ),
-    )
-
-    parser.add_argument(
-        "--store",
-        type=Path,
-        default=EVENTSTORE_T1_PATH,
-        help=(
-            f"Tier 1 observation store "
-            f"(default: {EVENTSTORE_T1_PATH})."
-        ),
+        "--false-positives",
+        type=str,
+        default=None,
+        help="Comma-separated forms to exclude.",
     )
 
     parser.add_argument(
         "--from-year",
         type=int,
         default=None,
-        help="Restrict retrieval to this publication year or later.",
+        help="Earliest publication year to search.",
     )
 
     parser.add_argument(
         "--to-year",
         type=int,
         default=None,
-        help="Restrict retrieval to this publication year or earlier.",
+        help="Latest publication year to search.",
+    )
+
+    parser.add_argument(
+        "--scale",
+        action="append",
+        choices=SCALES,
+        dest="scales",
+        help="Scale to use; may be specified more than once.",
+    )
+
+    parser.add_argument(
+        "--lance",
+        type=str,
+        default=str(LANCE_INDEXES_DIR),
+        help="Lance index root.",
+    )
+
+    parser.add_argument(
+        "--sqlite",
+        type=str,
+        default=str(CORPUS_TIER2_DB_PATH),
+        help="Tier 2 SQLite output path.",
     )
 
     return parser.parse_args()
@@ -367,115 +386,145 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    if args.concept is not None:
-        args_concept_norm = args.concept.upper()
+    if args.k <= 0:
+        raise ValueError("--k must be positive")
 
-        if args_concept_norm not in CONCEPT_SETS:
-            available = ", ".join(
-                sorted(CONCEPT_SETS)
-            )
+    if args.rrf_k <= 0:
+        raise ValueError("--rrf-k must be positive")
 
-            raise SystemExit(
-                f"Unknown concept {args_concept_norm!r}.\n"
-                f"Available concepts: {available}"
-            )
+    if args.oversample <= 0:
+        raise ValueError("--oversample must be positive")
 
-        concept_names = [args_concept_norm]
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
 
-    else:
-        concept_names = list(
-            CONCEPT_SETS
+    if (
+        args.from_year is not None
+        and args.to_year is not None
+        and args.from_year > args.to_year
+    ):
+        raise ValueError(
+            "--from-year cannot be later than --to-year"
         )
 
-    scales = (
-        tuple(args.scale)
-        if args.scale
-        else SCALES
+    if args.concept:
+        concept_name = args.concept.upper()
+
+        if concept_name not in CONCEPT_SETS:
+            raise ValueError(
+                f"Unknown concept: {concept_name}"
+            )
+
+        concept_names = [concept_name]
+    else:
+        concept_names = list(CONCEPT_SETS)
+
+    requested_scales = (
+        tuple(args.scales)
+        if args.scales
+        else None
     )
 
     search_space = SearchSpace(
-        years=(
-            (
-                args.from_year,
-                args.to_year,
-            )
-            if (
-                args.from_year is not None
-                or args.to_year is not None
-            )
-            else None
+        years=_year_range(
+            args.from_year,
+            args.to_year,
         ),
-        scale=None,
+        scale=requested_scales,
     )
 
-    logger.info( "[tier2] processing %d concept(s)", len(concept_names), )
-    logger.info( "[tier2] SQLite output: %s", args.sqlite, )
-
-    lookup = open_observation_lookup( args.store )
-
-    (
-        candidate_years,
-        scales,
-        year_start,
-        year_end,
-    ) = _resolve_search_scope(
-        search_space,
-        lookup,
-        scales,
+    logger.info(
+        "[tier2] processing %d concept(s)",
+        len(concept_names),
     )
 
-    logger.info( "[tier2] SearchSpace years=%s scales=%s", candidate_years, scales, )
-
-    db_started = time.perf_counter()
-
-    index_store = LanceObservationIndexStore(
-        args.lance,
-        available_years=lookup.available_years,
-        available_scales=scales,
+    logger.info(
+        "[tier2] SQLite output: %s",
+        args.sqlite,
     )
 
-    logger.info( "[tier2] opened Lance observation index store in %.3fs", time.perf_counter() - db_started, )
+    connection = get_connection()
 
-    indexes_by_year = {
-        year: index_store.get(
-            SearchSpace(
-                years=(year, year),
-                scale=scales,
-            )
+    try:
+        available_years = _available_event_years( connection )
+
+        logger.debug( "[tier2] available event years: %s", available_years, )
+
+        (
+            candidate_years,
+            scales,
+        ) = _resolve_search_scope(
+            search_space,
+            available_years,
         )
-        for year in candidate_years
-    }
 
-    logger.info( "[tier2] prepared temporal indexes for %d year(s)", len(indexes_by_year), )
+        # logger.info( "[tier2] SearchSpace years=%s scales=%s", candidate_years, scales, )
 
-    for index, concept_name in enumerate(
-        concept_names,
-        start=1,
-    ):
-        logger.info( "[tier2] ===== concept %d/%d: %s =====", index, len(concept_names), concept_name, )
+        if not candidate_years:
+            logger.warning( "[tier2] no candidate years; nothing to run" )
+            return
 
-        # --clear is deliberately consumed only by the first concept.
-        # Otherwise every concept would erase the results of its predecessor.
-        clear = ( args.clear and index == 1 )
+        index_started = time.perf_counter()
 
-        run_lance_tier2(
-            top_n=args.k,
-            oversample=args.oversample,
-            concept_name=concept_name,
-            concept=CONCEPT_SETS[concept_name],
-            search_space=search_space,
-            store_path=args.store,
-            sqlite_path=args.sqlite,
-            clear=clear,
-            lookup=lookup,
-            indexes_by_year=indexes_by_year,
+        indexes_by_year = _build_indexes_by_year(
+            lance_root=args.lance,
             candidate_years=candidate_years,
             scales=scales,
-            year_start=year_start,
-            year_end=year_end,
         )
 
-    logger.info( "[tier2] completed %d concept(s)", len(concept_names) )
+        logger.info( "[tier2] prepared %d temporal index sets in %.3fs", len(indexes_by_year), time.perf_counter() - index_started, )
+
+        false_positives = (
+            [
+                value.strip()
+                for value in args.false_positives.split(",")
+                if value.strip()
+            ]
+            if args.false_positives
+            else None
+        )
+
+        for index, concept_name in enumerate(
+            concept_names,
+            start=1,
+        ):
+            logger.info(
+                "[tier2] ===== concept %d/%d: %s =====",
+                index,
+                len(concept_names),
+                concept_name,
+            )
+
+            # --clear belongs only to the first concept; otherwise each
+            # subsequent concept would erase the preceding results.
+            clear = (
+                args.clear
+                and index == 1
+            )
+
+            run_lance_tier2(
+                connection=connection,
+                concept_name=concept_name,
+                concept=CONCEPT_SETS[concept_name],
+                indexes_by_year=indexes_by_year,
+                candidate_years=candidate_years,
+                scales=scales,
+                sqlite_path=args.sqlite,
+                top_n=args.k,
+                rrf_k=args.rrf_k,
+                oversample=args.oversample,
+                batch_size=args.batch_size,
+                false_positives=false_positives,
+                clear=clear,
+            )
+
+        logger.info(
+            "[tier2] completed %d concept(s)",
+            len(concept_names),
+        )
+
+    finally:
+        connection.close()
 
 
 if __name__ == "__main__":

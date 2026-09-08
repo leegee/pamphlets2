@@ -17,6 +17,7 @@ from lib.corpus_config import CONCEPT_SETS, EMBED_BATCH_SIZE, LANCE_INDEXES_DIR
 from lib.corpus_db import get_connection
 from lib.corpus_logging import logger
 from lib.macberth import load_macberth
+from retrieval.models import SCALES
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("OMP_NUM_THREADS", "4")
@@ -29,8 +30,6 @@ WINDOW_CONFIGS = (
     {"name": "medium", "size": 512, "stride": 256},
     {"name": "broad", "size": 512, "stride": 384},
 )
-
-SCALES = tuple(config["name"] for config in WINDOW_CONFIGS)
 
 LANCE_MODEL_NAME = "macberth"
 LANCE_BUCKET_SIZE = 50

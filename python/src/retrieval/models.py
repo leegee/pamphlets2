@@ -1,3 +1,5 @@
+# retrieval/models.py
+
 from dataclasses import dataclass
 from typing import Iterator, Literal
 
@@ -13,6 +15,7 @@ UInt64Array = NDArray[np.uint64]
 # observations.
 INVALID_EVENT_ID = np.iinfo(np.uint64).max
 
+SCALES = ("local", "medium", "broad")
 
 @dataclass(frozen=True, slots=True)
 class SearchSpace:
@@ -33,11 +36,7 @@ class SearchSpace:
     years: tuple[int, int] | None
     scale: tuple[str, ...] | None
 
-    _VALID_SCALES = frozenset({
-        "local",
-        "medium",
-        "broad",
-    })
+    _VALID_SCALES = frozenset(SCALES)
 
     def __post_init__(self) -> None:
         if self.years is not None:
@@ -183,11 +182,7 @@ class SearchSpace:
         if self.scale is None:
             return tuple(
                 scale
-                for scale in (
-                    "local",
-                    "medium",
-                    "broad",
-                )
+                for scale in SCALES
                 if scale in available
             )
 
