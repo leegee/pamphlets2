@@ -17,8 +17,6 @@ from lib.corpus_config import CONCEPT_SETS, EMBED_BATCH_SIZE, LANCE_INDEXES_DIR
 from lib.corpus_db import get_connection
 from lib.corpus_logging import logger
 from lib.macberth import load_macberth
-from lib.stopwords_min import STOPWORDS
-
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("OMP_NUM_THREADS", "4")
@@ -39,9 +37,10 @@ LANCE_BUCKET_SIZE = 50
 
 
 def stable_hash(key: str) -> int:
-    # The same corpus/document/token occurrence must address the same
-    # observation across all three Lance scale tables and across reruns.
-    return xxhash.xxh64(key, seed=0).intdigest()
+    # PostgreSQL BIGINT is signed, whereas xxhash returns an unsigned
+    # 64-bit integer. Keep the stable lower 63 bits so the same occurrence
+    # receives the same PostgreSQL-safe ID on every rerun.
+    return xxhash.xxh64(key, seed=0).intdigest() & 0x7FFFFFFFFFFFFFFF
 
 
 def normalise_token(token: str) -> str:
@@ -199,23 +198,56 @@ class MacBERThPipeline:
                 hidden = self._forward(batch)
 
                 for job, vectors in zip(batch, hidden):
-                    for word_position, vector in zip(
+                    for target, vector in zip(
                         job["targets"],
                         vectors,
                     ):
+                        word_position = target["word_position"]
+
+                        if word_position not in results:
+                            raise RuntimeError(
+                                "Embedding returned a target position "
+                                f"that was not requested: {word_position}"
+                            )
+
                         results[word_position][
                             config["name"]
                         ] = vector
 
-        incomplete = [
-            position
-            for position, vectors in results.items()
-            if set(vectors) != set(SCALES)
-        ]
+        missing = []
 
-        if incomplete:
+        for position in sorted(target_positions):
+            missing_scales = [
+                scale
+                for scale in SCALES
+                if scale not in results[position]
+            ]
+
+            if missing_scales:
+                missing.append(
+                    (
+                        position,
+                        document.rows[position].token,
+                        missing_scales,
+                    )
+                )
+
+        if missing:
+            logger.error(
+                "[tier1] incomplete embeddings: %d observations",
+                len(missing),
+            )
+
+            for position, token, scales in missing[:20]:
+                logger.error(
+                    "[tier1] position=%d token=%r missing=%s",
+                    position,
+                    token,
+                    scales,
+                )
+
             raise RuntimeError(
-                f"{len(incomplete)} observations did not receive "
+                f"{len(missing)} observations did not receive "
                 "all three scale embeddings."
             )
 
@@ -240,63 +272,97 @@ class MacBERThPipeline:
             + 1
         )
 
+        word_spans: list[tuple[int, int]] = []
+        current_word = None
+        current_start = None
+
+        for encoded_position, word_id in enumerate(word_ids):
+            if word_id is None:
+                continue
+
+            if word_id != current_word:
+                if current_word is not None:
+                    word_spans.append(
+                        (
+                            current_start,
+                            encoded_position,
+                        )
+                    )
+
+                current_word = word_id
+                current_start = encoded_position
+
+        if current_word is not None:
+            word_spans.append(
+                (
+                    current_start,
+                    len(word_ids),
+                )
+            )
+
+        if len(word_spans) != word_count:
+            raise RuntimeError(
+                "MacBERTh word alignment is incomplete: "
+                f"expected {word_count} corpus tokens, "
+                f"got {len(word_spans)} encoded spans."
+            )
+
         jobs: list[dict] = []
+        covered_targets: set[int] = set()
 
         start_word = 0
 
         while start_word < word_count:
-            encoded_positions = [
-                index
-                for index, word_id in enumerate(word_ids)
-                if word_id is not None
-                and start_word <= word_id < start_word + window_size
-            ]
+            end_word = min(
+                word_count,
+                start_word + window_size,
+            )
 
-            if not encoded_positions:
-                break
+            candidate_targets = sorted(
+                position
+                for position in target_positions
+                if start_word <= position < end_word
+            )
 
-            encoded_start = min(encoded_positions)
-            encoded_end = max(encoded_positions) + 1
+            if candidate_targets:
+                group: list[int] = []
 
-            targets = [
-                word_id
-                for word_id in target_positions
-                if start_word <= word_id < start_word + window_size
-            ]
-
-            if targets:
-                window_ids = input_ids[
-                    encoded_start:encoded_end
-                ].copy()
-
-                window_mask = attention_mask[
-                    encoded_start:encoded_end
-                ]
-
-                target_encoded_positions = []
-
-                for target in targets:
-                    try:
-                        relative = word_ids[
-                            encoded_start:encoded_end
-                        ].index(target)
-                    except ValueError:
+                for target in candidate_targets:
+                    if not group:
+                        group.append(target)
                         continue
 
-                    target_encoded_positions.append(relative)
+                    group_start = word_spans[group[0]][0]
+                    group_end = word_spans[target][1]
 
-                    if self.mask_targets:
-                        window_ids[relative] = (
-                            self.tokenizer.mask_token_id
+                    if group_end - group_start <= 512:
+                        group.append(target)
+                    else:
+                        self._append_job(
+                            jobs=jobs,
+                            covered_targets=covered_targets,
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            word_ids=word_ids,
+                            word_spans=word_spans,
+                            target_positions=group,
+                            context_start_word=start_word,
+                            context_end_word=end_word,
                         )
 
-                if target_encoded_positions:
-                    jobs.append(
-                        {
-                            "input_ids": window_ids,
-                            "attention_mask": window_mask,
-                            "targets": target_encoded_positions,
-                        }
+                        group = [target]
+
+                if group:
+                    self._append_job(
+                        jobs=jobs,
+                        covered_targets=covered_targets,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        word_ids=word_ids,
+                        word_spans=word_spans,
+                        target_positions=group,
+                        context_start_word=start_word,
+                        context_end_word=end_word,
                     )
 
             if start_word + stride >= word_count:
@@ -304,7 +370,146 @@ class MacBERThPipeline:
 
             start_word += stride
 
+        missing_targets = target_positions - covered_targets
+
+        if missing_targets:
+            raise RuntimeError(
+                "Some target observations were not assigned to "
+                f"a MacBERTh job: {sorted(missing_targets)[:20]}"
+            )
+
         return jobs
+
+    def _append_job(
+        self,
+        *,
+        jobs: list[dict],
+        covered_targets: set[int],
+        input_ids: list[int],
+        attention_mask: list[int],
+        word_ids: list[int | None],
+        word_spans: list[tuple[int, int]],
+        target_positions: list[int],
+        context_start_word: int,
+        context_end_word: int,
+    ) -> None:
+        target_start_word = target_positions[0]
+        target_end_word = target_positions[-1] + 1
+
+        context_start = word_spans[
+            context_start_word
+        ][0]
+
+        context_end = word_spans[
+            context_end_word - 1
+        ][1]
+
+        target_start = word_spans[
+            target_start_word
+        ][0]
+
+        target_end = word_spans[
+            target_end_word - 1
+        ][1]
+
+        target_span = target_end - target_start
+
+        if target_span > 512:
+            raise RuntimeError(
+                "A target group exceeds MacBERTh's 512-position "
+                f"limit: targets={target_start_word}:"
+                f"{target_end_word}, encoded_length={target_span}"
+            )
+
+        available_length = context_end - context_start
+
+        if available_length > 512:
+            desired_start = target_start - (
+                512 - target_span
+            ) // 2
+
+            encoded_start = max(
+                context_start,
+                desired_start,
+            )
+
+            encoded_end = min(
+                context_end,
+                encoded_start + 512,
+            )
+
+            if encoded_end - encoded_start < 512:
+                encoded_start = max(
+                    context_start,
+                    encoded_end - 512,
+                )
+        else:
+            encoded_start = context_start
+            encoded_end = context_end
+
+        if not (
+            encoded_start <= target_start
+            and target_end <= encoded_end
+        ):
+            raise RuntimeError(
+                "Constructed MacBERTh context does not contain "
+                f"all targets: targets={target_start_word}:"
+                f"{target_end_word}, "
+                f"context={context_start_word}:"
+                f"{context_end_word}"
+            )
+
+        relative_word_ids = word_ids[
+            encoded_start:encoded_end
+        ]
+
+        window_ids = input_ids[
+            encoded_start:encoded_end
+        ].copy()
+
+        window_mask = attention_mask[
+            encoded_start:encoded_end
+        ]
+
+        target_positions_in_window = []
+
+        for word_position in target_positions:
+            try:
+                relative = relative_word_ids.index(
+                    word_position
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Target disappeared from its MacBERTh "
+                    f"window: word_position={word_position}"
+                ) from exc
+
+            target_positions_in_window.append(
+                {
+                    "word_position": word_position,
+                    "encoded_position": relative,
+                }
+            )
+
+            if self.mask_targets:
+                mask_token_id = self.tokenizer.mask_token_id
+
+                if mask_token_id is None:
+                    raise RuntimeError(
+                        "MacBERTh tokenizer has no mask token."
+                    )
+
+                window_ids[relative] = mask_token_id
+
+        jobs.append(
+            {
+                "input_ids": window_ids,
+                "attention_mask": window_mask,
+                "targets": target_positions_in_window,
+            }
+        )
+
+        covered_targets.update(target_positions)
 
     def _forward(
         self,
@@ -318,6 +523,20 @@ class MacBERThPipeline:
             for job in jobs
         )
 
+        # BERT's internal token_type_ids buffer is only 512 tokens long.
+        # The job builder therefore guarantees max_length <= 512.
+        if max_length > 512:
+            raise RuntimeError(
+                f"Prepared MacBERTh batch exceeds 512 tokens: {max_length}"
+            )
+
+        pad_token_id = self.tokenizer.pad_token_id
+
+        if pad_token_id is None:
+            raise RuntimeError(
+                "MacBERTh tokenizer has no pad token."
+            )
+
         input_ids = []
         attention_masks = []
 
@@ -325,7 +544,7 @@ class MacBERThPipeline:
             padding = max_length - len(job["input_ids"])
 
             input_ids.append(
-                job["input_ids"] + [0] * padding
+                job["input_ids"] + [pad_token_id] * padding
             )
 
             attention_masks.append(
@@ -345,7 +564,9 @@ class MacBERThPipeline:
         )
 
         with torch.inference_mode():
-            output = self.model(
+            # Use MacberthModel.encode(), which deliberately calls
+            # model.base_model rather than the MaskedLM head.
+            output = self.mac.encode(
                 input_ids=input_tensor,
                 attention_mask=attention_tensor,
                 return_dict=True,
@@ -357,9 +578,9 @@ class MacBERThPipeline:
             [
                 hidden[
                     batch_index,
-                    target_position,
+                    target["encoded_position"],
                 ].astype(np.float32, copy=False)
-                for target_position in job["targets"]
+                for target in job["targets"]
             ]
             for batch_index, job in enumerate(jobs)
         ]
@@ -382,10 +603,60 @@ class EventWriter:
         if not observations:
             return 0
 
-        self._write_postgres(observations)
-        self._write_lance(observations)
+        new_observations = self._new_observations(
+            observations
+        )
 
-        return len(observations)
+        if not new_observations:
+            return 0
+
+        self._write_postgres(new_observations)
+        self._write_lance(new_observations)
+
+        return len(new_observations)
+
+    def repair_lance(
+        self,
+        observations: list[EmbeddedObservation],
+    ) -> int:
+        if not observations:
+            return 0
+
+        # Repair deliberately does not consult or modify PostgreSQL.
+        # The repair unit is a document whose current event records already
+        # exist; Lance is reconciled only for the explicitly requested work.
+        return self._write_lance(observations)
+
+    def _new_observations(
+        self,
+        observations: list[EmbeddedObservation],
+    ) -> list[EmbeddedObservation]:
+        event_ids = [
+            embedded.observation.event_id
+            for embedded in observations
+        ]
+
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT event_id
+                FROM events
+                WHERE event_id = ANY(%s)
+                """,
+                (event_ids,),
+            )
+
+            existing_ids = {
+                row[0]
+                for row in cur.fetchall()
+            }
+
+        return [
+            embedded
+            for embedded in observations
+            if embedded.observation.event_id
+            not in existing_ids
+        ]
 
     def _write_postgres(
         self,
@@ -429,7 +700,7 @@ class EventWriter:
     def _write_lance(
         self,
         observations: list[EmbeddedObservation],
-    ) -> None:
+    ) -> int:
         rows_by_table: dict[str, list[dict]] = defaultdict(list)
 
         for embedded in observations:
@@ -457,22 +728,90 @@ class EventWriter:
                     }
                 )
 
-        for table_name, rows in rows_by_table.items():
-            table = self._open_table(table_name)
-            table.add(rows, mode="append")
+        written_event_ids: set[int] = set()
 
-    def _open_table(self, table_name: str):
+        for table_name, rows in rows_by_table.items():
+            table = self._open_table(
+                table_name,
+                vector_dimensions=len(rows[0]["vector"]),
+            )
+
+            existing_ids = self._existing_lance_ids(
+                table,
+                {
+                    row["event_id"]
+                    for row in rows
+                },
+            )
+
+            new_rows = [
+                row
+                for row in rows
+                if row["event_id"] not in existing_ids
+            ]
+
+            if new_rows:
+                table.add(
+                    new_rows,
+                    mode="append",
+                )
+
+                written_event_ids.update(
+                    row["event_id"]
+                    for row in new_rows
+                )
+
+        return len(written_event_ids)
+
+    def _existing_lance_ids(
+        self,
+        table,
+        event_ids: set[int],
+    ) -> set[int]:
+        if not event_ids:
+            return set()
+
+        arrow = table.to_arrow()
+
+        existing = set(
+            arrow.column("event_id").to_pylist()
+        )
+
+        return existing.intersection(event_ids)
+
+    def _open_table(
+        self,
+        table_name: str,
+        *,
+        vector_dimensions: int,
+    ):
         if table_name in self.tables:
             return self.tables[table_name]
 
-        if table_name not in self.lance.table_names():
-            raise RuntimeError(
-                f"Lance table does not exist: {table_name}. "
-                "The Tier 1 producer never creates production "
-                "tables implicitly."
-            )
+        table_names = set(
+            self.lance.list_tables().tables
+        )
 
-        table = self.lance.open_table(table_name)
+        if table_name in table_names:
+            table = self.lance.open_table(table_name)
+            self.tables[table_name] = table
+            return table
+
+        logger.info(
+            "[tier1] creating Lance table: %s",
+            table_name,
+        )
+
+        table = self.lance.create_table(
+            table_name,
+            schema={
+                "event_id": np.uint64,
+                "year": np.int32,
+                "embedding_model": str,
+                "vector": lancedb.vector(vector_dimensions),
+            },
+        )
+
         self.tables[table_name] = table
 
         return table
@@ -510,6 +849,12 @@ class CorpusProcessor:
             len(documents),
         )
 
+        if documents:
+            logger.info(
+                "[tier1] first seed documents: %s",
+                documents[:5],
+            )
+
         for number, (document_corpus, document_id) in enumerate(
             documents,
             start=1,
@@ -543,38 +888,18 @@ class CorpusProcessor:
                 target_positions,
             )
 
-            observations = []
-
-            for position in sorted(target_positions):
-                row = document.rows[position]
-
-                observation = Observation(
-                    event_id=stable_hash(
-                        f"{row.corpus}:"
-                        f"{row.doc_id}:"
-                        f"{row.token_idx}"
-                    ),
-                    corpus=row.corpus,
-                    doc_id=row.doc_id,
-                    token=row.token,
-                    token_idx=row.token_idx,
-                    pub_year=row.pub_year,
-                )
-
-                observations.append(
-                    EmbeddedObservation(
-                        observation=observation,
-                        vectors=embeddings[position],
-                    )
-                )
+            observations = self._build_observations(
+                document,
+                target_positions,
+                embeddings,
+            )
 
             written = self.writer.write(observations)
 
             elapsed = time.perf_counter() - started
 
             logger.info(
-                "[tier1] %d/%d %s/%s: seeds=%d "
-                "observations=%d written=%d elapsed=%.2fs",
+                "[tier1] %3d/%-3d %-4s %-15s seeds=%3d observations=%5d written=%5d elapsed=%7.2fs",
                 number,
                 len(documents),
                 document_corpus,
@@ -590,6 +915,113 @@ class CorpusProcessor:
                     "[tier1] processed %d documents",
                     number,
                 )
+
+    def repair(
+        self,
+        *,
+        corpus: str,
+        doc_id: str,
+    ) -> None:
+        started = time.perf_counter()
+
+        logger.info(
+            "[tier1] repair: %s/%s",
+            corpus,
+            doc_id,
+        )
+
+        document = self._load_document(
+            corpus,
+            doc_id,
+        )
+
+        if document is None:
+            raise RuntimeError(
+                f"Document not found: {corpus}/{doc_id}"
+            )
+
+        seed_positions = {
+            position
+            for position, row in enumerate(document.rows)
+            if is_seed(row.token)
+        }
+
+        if not seed_positions:
+            raise RuntimeError(
+                f"No seed occurrences found: {corpus}/{doc_id}"
+            )
+
+        target_positions = self._select_neighbours(
+            seed_positions,
+            len(document.rows),
+        )
+
+        logger.info(
+            "[tier1] repair: seeds=%d observations=%d",
+            len(seed_positions),
+            len(target_positions),
+        )
+
+        embeddings = self.pipeline.embed(
+            document,
+            target_positions,
+        )
+
+        observations = self._build_observations(
+            document,
+            target_positions,
+            embeddings,
+        )
+
+        written = self.writer.repair_lance(
+            observations,
+        )
+
+        elapsed = time.perf_counter() - started
+
+        logger.info(
+            "[tier1] repair complete: %-4s %-15s "
+            "seeds=%3d observations=%5d lance_written=%5d elapsed=%7.2fs",
+            corpus,
+            doc_id,
+            len(seed_positions),
+            len(observations),
+            written,
+            elapsed,
+        )
+
+    def _build_observations(
+        self,
+        document: DocBuffer,
+        target_positions: set[int],
+        embeddings: dict[int, dict[str, np.ndarray]],
+    ) -> list[EmbeddedObservation]:
+        observations = []
+
+        for position in sorted(target_positions):
+            row = document.rows[position]
+
+            observation = Observation(
+                event_id=stable_hash(
+                    f"{row.corpus}:"
+                    f"{row.doc_id}:"
+                    f"{row.token_idx}"
+                ),
+                corpus=row.corpus,
+                doc_id=row.doc_id,
+                token=row.token,
+                token_idx=row.token_idx,
+                pub_year=row.pub_year,
+            )
+
+            observations.append(
+                EmbeddedObservation(
+                    observation=observation,
+                    vectors=embeddings[position],
+                )
+            )
+
+        return observations
 
     def _find_seed_documents(
         self,
@@ -697,6 +1129,22 @@ class CorpusProcessor:
         return positions
 
 
+def parse_repair_target(value: str) -> tuple[str, str]:
+    if "/" not in value:
+        raise argparse.ArgumentTypeError(
+            "repair target must be CORPUS/DOC_ID"
+        )
+
+    corpus, doc_id = value.split("/", 1)
+
+    if not corpus or not doc_id:
+        raise argparse.ArgumentTypeError(
+            "repair target must be CORPUS/DOC_ID"
+        )
+
+    return corpus, doc_id
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -713,6 +1161,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--doc-id",
         default=None,
+    )
+
+    parser.add_argument(
+        "--repair",
+        type=parse_repair_target,
+        metavar="CORPUS/DOC_ID",
+        help=(
+            "Regenerate Lance vectors for one document without "
+            "modifying PostgreSQL events."
+        ),
     )
 
     parser.add_argument(
@@ -745,7 +1203,17 @@ def parse_args() -> argparse.Namespace:
         default=Path(LANCE_INDEXES_DIR),
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.repair is not None and (
+        args.corpus is not None
+        or args.doc_id is not None
+    ):
+        parser.error(
+            "--repair cannot be combined with --corpus or --doc-id"
+        )
+
+    return args
 
 
 def main() -> None:
@@ -780,10 +1248,18 @@ def main() -> None:
             report_every=args.report_every,
         )
 
-        processor.process(
-            corpus=args.corpus,
-            doc_id=args.doc_id,
-        )
+        if args.repair is not None:
+            corpus, doc_id = args.repair
+
+            processor.repair(
+                corpus=corpus,
+                doc_id=doc_id,
+            )
+        else:
+            processor.process(
+                corpus=args.corpus,
+                doc_id=args.doc_id,
+            )
     finally:
         conn.close()
 
